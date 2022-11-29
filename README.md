@@ -9,6 +9,8 @@ python sac_n_jax_flax.py --env_name="halfcheetah-medium-v2" --num_critics=10 --b
 ```
 Optionally, you can pass `--config_path` to the yaml file, for more see [pyrallis](https://github.com/eladrich/pyrallis) docs.
 
+Main insight here is to jit epoch loop, not just one update of the networks, as it is usually done ([jaxrl2](https://github.com/ikostrikov/jaxrl2/blob/main/examples/train_offline.py) for instance). 
+
 ## Speed comparison
 Both runs were trained on same V100 GPU.
 
