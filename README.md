@@ -10,6 +10,7 @@ python sac_n_jax_flax.py --env_name="halfcheetah-medium-v2" --num_critics=10 --b
 Optionally, you can pass `--config_path` to the yaml file, for more see [pyrallis](https://github.com/eladrich/pyrallis) docs.
 
 ## Speed comparison
+Both runs were trained on same V100 GPU.
 
 ![return_epochs](images/score_epochs.png)
 ![return_time](images/score_wall_time.png)
