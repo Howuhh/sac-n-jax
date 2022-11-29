@@ -195,7 +195,7 @@ def update_critic(
     loss, grads = jax.value_and_grad(critic_loss_fn)(critic.params)
     new_critic = critic.apply_gradients(grads=grads)
     info = {
-        "critic_loss": loss.item()
+        "critic_loss": loss
     }
     return new_critic, info
 
@@ -215,8 +215,8 @@ def update_actor(
         loss = (alpha.apply_fn(alpha.params) * actions_logp.sum(-1) - q).mean()
 
         info = {
-            "batch_entropy": -actions_logp.sum(-1).mean().item(),
-            "actor_loss": loss.item()
+            "batch_entropy": -actions_logp.sum(-1).mean(),
+            "actor_loss": loss
         }
         return loss, info
 
@@ -236,8 +236,8 @@ def update_alpha(
         loss = (alpha_value * (entropy - target_entropy)).mean()
 
         info = {
-            "alpha": alpha_value.item(),
-            "alpha_loss": loss.item()
+            "alpha": alpha_value,
+            "alpha_loss": loss
         }
         return loss, info
 
