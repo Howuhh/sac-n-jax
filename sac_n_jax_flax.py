@@ -71,7 +71,7 @@ class ReplayBuffer:
 
     @property
     def size(self):
-        # WARN: does not use __len__ here! It will use len of the dataclass, i.e. number of fields.
+        # WARN: do not use __len__ here! It will use len of the dataclass, i.e. number of fields.
         return self.data["states"].shape[0]
 
     def sample_batch(self, key: jax.random.PRNGKey, batch_size: int) -> Dict[str, jax.Array]:
@@ -195,7 +195,7 @@ def update_critic(
     loss, grads = jax.value_and_grad(critic_loss_fn)(critic.params)
     new_critic = critic.apply_gradients(grads=grads)
     info = {
-        "critic_loss": loss
+        "critic_loss": loss.item()
     }
     return new_critic, info
 
@@ -215,8 +215,8 @@ def update_actor(
         loss = (alpha.apply_fn(alpha.params) * actions_logp.sum(-1) - q).mean()
 
         info = {
-            "batch_entropy": -actions_logp.sum(-1).mean(),
-            "actor_loss": loss
+            "batch_entropy": -actions_logp.sum(-1).mean().item(),
+            "actor_loss": loss.item()
         }
         return loss, info
 
@@ -236,8 +236,8 @@ def update_alpha(
         loss = (alpha_value * (entropy - target_entropy)).mean()
 
         info = {
-            "alpha": alpha_value,
-            "alpha_loss": loss
+            "alpha": alpha_value.item(),
+            "alpha_loss": loss.item()
         }
         return loss, info
 
@@ -390,6 +390,8 @@ def main(config: Config):
         carry["critic"] = critic
         carry["target_critic_params"] = target_critic_params
         carry["alpha"] = alpha
+        carry["update_info"] = jax.tree_map(lambda c, u: c + u, carry["update_info"], update_info)
+
         return carry
 
     update_carry = {
@@ -398,16 +400,26 @@ def main(config: Config):
         "critic": critic,
         "target_critic_params": target_critic_params,
         "alpha": alpha,
-        "buffer": buffer
+        "buffer": buffer,
     }
     for epoch in trange(config.num_epochs):
-        # TODO: how to log to wandb nicely?
+        # metrics for accumulation during epoch and logging to wandb, so we need to reset them every epoch
+        update_carry["update_info"] = {
+            "critic_loss": jnp.array([0.0]),
+            "actor_loss": jnp.array([0.0]),
+            "alpha_loss": jnp.array([0.0]),
+            "alpha": jnp.array([0.0]),
+            "batch_entropy": jnp.array([0.0])
+        }
         update_carry = jax.lax.fori_loop(
             lower=0,
             upper=config.num_updates_on_epoch,
             body_fun=update_step,
             init_val=update_carry
         )
+        # log mean over epoch for each metric
+        update_info = jax.tree_map(lambda v: v / config.num_updates_on_epoch, update_carry["update_info"])
+        wandb.log({"epoch": epoch, **update_info})
 
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
             eval_returns = evaluate(eval_env, update_carry["actor"], config.eval_episodes, seed=config.eval_seed)
