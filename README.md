@@ -1,4 +1,4 @@
-# SAC with Q-Ensemble for Offfline RL
+# SAC with Q-Ensemble for Offline RL
 
 Single-file SAC-N [1] implementation on jax & flax. 10x faster than SAC-N on pytorch from CORL [2]. 
 
