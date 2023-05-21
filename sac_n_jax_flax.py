@@ -27,7 +27,7 @@ class Config:
     # wandb params
     project: str = "SAC-N-JAX"
     group: str = "SAC-N"
-    name: str = "sac-n-jax"
+    name: str = "sac-n-jax-flax"
     # model params
     hidden_dim: int = 256
     num_critics: int = 10
@@ -47,7 +47,6 @@ class Config:
     # general params
     train_seed: int = 10
     eval_seed: int = 42
-    log_every: int = 100
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
@@ -61,10 +60,10 @@ class ReplayBuffer:
     def create_from_d4rl(dataset_name: str) -> "ReplayBuffer":
         d4rl_data = d4rl.qlearning_dataset(gym.make(dataset_name))
         buffer = {
-            "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
+            "obs": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
             "actions": jnp.asarray(d4rl_data["actions"], dtype=jnp.float32),
             "rewards": jnp.asarray(d4rl_data["rewards"], dtype=jnp.float32),
-            "next_states": jnp.asarray(d4rl_data["next_observations"], dtype=jnp.float32),
+            "next_obs": jnp.asarray(d4rl_data["next_observations"], dtype=jnp.float32),
             "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32)
         }
         return ReplayBuffer(data=buffer)
@@ -72,7 +71,7 @@ class ReplayBuffer:
     @property
     def size(self):
         # WARN: do not use __len__ here! It will use len of the dataclass, i.e. number of fields.
-        return self.data["states"].shape[0]
+        return self.data["obs"].shape[0]
 
     def sample_batch(self, key: jax.random.PRNGKey, batch_size: int) -> Dict[str, jax.Array]:
         indices = jax.random.randint(key, shape=(batch_size,), minval=0, maxval=self.size)
@@ -80,7 +79,15 @@ class ReplayBuffer:
         return batch
 
 
-# SAC-n networks
+class CriticTrainState(TrainState):
+    target_params: flax.core.FrozenDict
+
+    def soft_update(self, tau):
+        new_target_params = optax.incremental_update(self.params, self.target_params, tau)
+        return self.replace(target_params=new_target_params)
+
+
+# SAC-N networks
 class TanhNormal(distrax.Transformed):
     def __init__(self, loc, scale):
         normal_dist = distrax.Normal(loc, scale)
@@ -170,36 +177,6 @@ class Alpha(nn.Module):
 
 
 # SAC-N losses
-def update_critic(
-        key: jax.random.PRNGKey,
-        actor: TrainState,
-        critic: TrainState,
-        target_critic: TrainState,
-        alpha: TrainState,
-        batch: Dict[str, jax.Array],
-        gamma: float
-) -> Tuple[TrainState, Dict[str, Any]]:
-    next_actions_dist = actor.apply_fn(actor.params, batch["next_states"])
-    next_actions, next_actions_logp = next_actions_dist.sample_and_log_prob(seed=key)
-
-    next_q = target_critic.apply_fn(target_critic.params, batch["next_states"], next_actions).min(0)
-    next_q = next_q - alpha.apply_fn(alpha.params) * next_actions_logp.sum(-1)
-    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
-
-    def critic_loss_fn(critic_params):
-        # [N, batch_size] - [1, batch_size]
-        q = critic.apply_fn(critic_params, batch["states"], batch["actions"])
-        loss = ((q - target_q[None, ...]) ** 2).mean(1).sum(0)
-        return loss
-
-    loss, grads = jax.value_and_grad(critic_loss_fn)(critic.params)
-    new_critic = critic.apply_gradients(grads=grads)
-    info = {
-        "critic_loss": loss
-    }
-    return new_critic, info
-
-
 def update_actor(
         key: jax.random.PRNGKey,
         actor: TrainState,
@@ -208,21 +185,21 @@ def update_actor(
         batch: Dict[str, jax.Array]
 ) -> Tuple[TrainState, Dict[str, Any]]:
     def actor_loss_fn(actor_params):
-        actions_dist = actor.apply_fn(actor_params, batch["states"])
+        actions_dist = actor.apply_fn(actor_params, batch["obs"])
         actions, actions_logp = actions_dist.sample_and_log_prob(seed=key)
 
-        q = critic.apply_fn(critic.params, batch["states"], actions).min(0)
-        loss = (alpha.apply_fn(alpha.params) * actions_logp.sum(-1) - q).mean()
+        q_values = critic.apply_fn(critic.params, batch["obs"], actions).min(0)
+        loss = (alpha.apply_fn(alpha.params) * actions_logp.sum(-1) - q_values).mean()
 
-        info = {
-            "batch_entropy": -actions_logp.sum(-1).mean(),
-            "actor_loss": loss
-        }
-        return loss, info
+        batch_entropy = -actions_logp.sum(-1).mean()
+        return loss, batch_entropy
 
-    grads, info = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+    (loss, batch_entropy), grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(actor.params)
     new_actor = actor.apply_gradients(grads=grads)
-
+    info = {
+        "batch_entropy": batch_entropy,
+        "actor_loss": loss
+    }
     return new_actor, info
 
 
@@ -234,66 +211,45 @@ def update_alpha(
     def alpha_loss_fn(alpha_params):
         alpha_value = alpha.apply_fn(alpha_params)
         loss = (alpha_value * (entropy - target_entropy)).mean()
+        return loss
 
-        info = {
-            "alpha": alpha_value,
-            "alpha_loss": loss
-        }
-        return loss, info
-
-    grads, info = jax.grad(alpha_loss_fn, has_aux=True)(alpha.params)
+    loss, grads = jax.value_and_grad(alpha_loss_fn)(alpha.params)
     new_alpha = alpha.apply_gradients(grads=grads)
-
+    info = {
+        "alpha": alpha.apply_fn(alpha.params),
+        "alpha_loss": loss
+    }
     return new_alpha, info
 
 
-def update_networks(
+def update_critic(
         key: jax.random.PRNGKey,
         actor: TrainState,
-        critic: TrainState,
-        target_critic_params: flax.core.FrozenDict,
+        critic: CriticTrainState,
         alpha: TrainState,
         batch: Dict[str, jax.Array],
-        target_entropy: float,
         gamma: float,
-        tau: float
-):
-    new_key, critic_key, actor_key = jax.random.split(key, 3)
-    # actor update
-    new_actor, actor_info = update_actor(
-        key=actor_key,
-        actor=actor,
-        critic=critic,
-        alpha=alpha,
-        batch=batch
-    )
-    # alpha update
-    new_alpha, alpha_info = update_alpha(
-        alpha=alpha,
-        entropy=actor_info["batch_entropy"],
-        target_entropy=target_entropy
-    )
-    # critic update
-    target_critic = critic.replace(params=target_critic_params)
-    new_critic, critic_info = update_critic(
-        key=critic_key,
-        actor=actor,
-        critic=critic,
-        target_critic=target_critic,
-        alpha=alpha,
-        batch=batch,
-        gamma=gamma
-    )
-    new_target_critic_params = optax.incremental_update(new_critic.params, target_critic_params, tau)
+        tau: float,
+) -> Tuple[TrainState, Dict[str, Any]]:
+    next_actions_dist = actor.apply_fn(actor.params, batch["next_obs"])
+    next_actions, next_actions_logp = next_actions_dist.sample_and_log_prob(seed=key)
 
-    return (
-        new_key,
-        new_actor,
-        new_critic,
-        new_target_critic_params,
-        new_alpha,
-        {**critic_info, **actor_info, **alpha_info}
-    )
+    next_q = critic.apply_fn(critic.target_params, batch["next_obs"], next_actions).min(0)
+    next_q = next_q - alpha.apply_fn(alpha.params) * next_actions_logp.sum(-1)
+    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
+
+    def critic_loss_fn(critic_params):
+        # [N, batch_size] - [1, batch_size]
+        q = critic.apply_fn(critic_params, batch["obs"], batch["actions"])
+        loss = ((q - target_q[None, ...]) ** 2).mean(1).sum(0)
+        return loss
+
+    loss, grads = jax.value_and_grad(critic_loss_fn)(critic.params)
+    new_critic = critic.apply_gradients(grads=grads).soft_update(tau=tau)
+    info = {
+        "critic_loss": loss
+    }
+    return new_critic, info
 
 
 # evaluation
@@ -336,6 +292,7 @@ def main(config: Config):
         group=config.group,
         name=config.name,
         id=str(uuid.uuid4()),
+        save_code=True
     )
 
     buffer = ReplayBuffer.create_from_d4rl(config.env_name)
@@ -355,12 +312,12 @@ def main(config: Config):
     )
 
     critic_module = EnsembleCritic(hidden_dim=config.hidden_dim, num_critics=config.num_critics)
-    critic = TrainState.create(
+    critic = CriticTrainState.create(
         apply_fn=critic_module.apply,
         params=critic_module.init(critic_key, init_state, init_action),
+        target_params=critic_module.init(critic_key, init_state, init_action),
         tx=optax.adam(learning_rate=config.critic_learning_rate),
     )
-    target_critic_params = copy.deepcopy(critic.params)
 
     alpha_module = Alpha()
     alpha = TrainState.create(
@@ -369,28 +326,29 @@ def main(config: Config):
         tx=optax.adam(learning_rate=config.alpha_learning_rate)
     )
 
+    def update_networks(key, actor, critic, alpha, batch):
+        actor_key, critic_key = jax.random.split(key)
+
+        new_actor, actor_info = update_actor(actor_key, actor, critic, alpha, batch)
+        new_alpha, alpha_info = update_alpha(alpha, actor_info["batch_entropy"], target_entropy)
+        new_critic, critic_info = update_critic(critic_key, new_actor, critic, new_alpha, batch, config.gamma, config.tau)
+
+        return new_actor, new_critic, new_alpha, {**actor_info, **critic_info, **alpha_info}
+
     @jax.jit
-    def update_step(update_idx, carry):
-        key, batch_key = jax.random.split(carry["key"])
+    def update_step(_, carry):
+        key, update_key, batch_key = jax.random.split(carry["key"], 3)
         batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
 
-        key, actor, critic, target_critic_params, alpha, update_info = update_networks(
-            key=key,
+        actor, critic, alpha, update_info = update_networks(
+            key=update_key,
             actor=carry["actor"],
             critic=carry["critic"],
-            target_critic_params=carry["target_critic_params"],
             alpha=carry["alpha"],
             batch=batch,
-            target_entropy=target_entropy,
-            gamma=config.gamma,
-            tau=config.tau
         )
-        carry["key"] = key
-        carry["actor"] = actor
-        carry["critic"] = critic
-        carry["target_critic_params"] = target_critic_params
-        carry["alpha"] = alpha
-        carry["update_info"] = jax.tree_map(lambda c, u: c + u, carry["update_info"], update_info)
+        update_info = jax.tree_map(lambda c, u: c + u, carry["update_info"], update_info)
+        carry.update(key=key, actor=actor, critic=critic, alpha=alpha, update_info=update_info)
 
         return carry
 
@@ -398,12 +356,11 @@ def main(config: Config):
         "key": key,
         "actor": actor,
         "critic": critic,
-        "target_critic_params": target_critic_params,
         "alpha": alpha,
         "buffer": buffer,
     }
     for epoch in trange(config.num_epochs):
-        # metrics for accumulation during epoch and logging to wandb, so we need to reset them every epoch
+        # metrics for accumulation during epoch and logging to wandb, we need to reset them every epoch
         update_carry["update_info"] = {
             "critic_loss": jnp.array([0.0]),
             "actor_loss": jnp.array([0.0]),
@@ -418,7 +375,7 @@ def main(config: Config):
             init_val=update_carry
         )
         # log mean over epoch for each metric
-        update_info = jax.tree_map(lambda v: v / config.num_updates_on_epoch, update_carry["update_info"])
+        update_info = jax.tree_map(lambda v: v.item() / config.num_updates_on_epoch, update_carry["update_info"])
         wandb.log({"epoch": epoch, **update_info})
 
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
@@ -427,8 +384,6 @@ def main(config: Config):
 
             wandb.log({
                 "epoch": epoch,
-                "eval/return_mean": np.mean(eval_returns),
-                "eval/return_std": np.std(eval_returns),
                 "eval/normalized_score_mean": np.mean(normalized_score),
                 "eval/normalized_score_std": np.std(normalized_score)
             })
